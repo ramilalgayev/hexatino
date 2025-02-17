@@ -1,2 +1,2 @@
 # hexatino
-A CLI matrix client
+A CLI chat client
