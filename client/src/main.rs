@@ -23,6 +23,7 @@ enum Message {
         msg: String,
         timestamp: String,
     },
+    Exit,
 }
 
 #[tokio::main]
@@ -155,8 +156,7 @@ async fn handle_connection(stream: tokio::net::TcpStream, is_server: bool) -> Re
 
 /// Starts the chat session by spawning a task that continuously receives messages,
 /// checks sequence numbers for replay protection, and prints them with timestamps.
-/// Meanwhile, the main task reads user input, attaches a sequence number and timestamp,
-/// and sends messages. Commands (currently, `/exit`) are handled.
+/// Meanwhile, the main task reads user input (and processes commands) before sending messages.
 async fn start_chat<R, W>(
     mut reader: BufReader<R>,
     mut writer: W,
@@ -198,10 +198,12 @@ where
                                         continue;
                                     }
                                     *last_seq = seq;
-                                    // Print the peer's message with timestamp on a new line.
+                                    // Print the peer's message with its timestamp on its own line.
                                     println!("\nPeer [{}]: {}", timestamp, msg);
-                                    print!("You: ");
-                                    io::stdout().flush().await.unwrap();
+                                },
+                                Message::Exit => {
+                                    println!("\nPeer has left the chat. Exiting...");
+                                    break;
                                 },
                                 _ => {
                                     eprintln!("Unexpected message type received during chat.");
@@ -228,19 +230,26 @@ where
     let mut input_line = String::new();
 
     loop {
+        // Print prompt.
         print!("You: ");
         io::stdout().flush().await?;
         input_line.clear();
         let bytes_read = stdin_reader.read_line(&mut input_line).await?;
         if bytes_read == 0 {
-            // End-of-file (Ctrl-D) or termination.
+            // End-of-file (Ctrl-D).
             break;
         }
         let trimmed = input_line.trim_end();
         // Check for commands.
         if trimmed.starts_with('/') {
-            // Currently only the /exit command is supported.
             if trimmed.eq_ignore_ascii_case("/exit") {
+                // Send an exit message.
+                let exit_msg = Message::Exit;
+                let serialized = bincode::serialize(&exit_msg)?;
+                let packet = encrypt_message(&serialized, &peer_public, &our_secret)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("Encryption failed: {:?}", e))?;
+                send_message(&mut writer, &packet).await?;
                 println!("Exiting chat session...");
                 break;
             } else {
@@ -248,7 +257,7 @@ where
                 continue;
             }
         }
-        // Get current timestamp as formatted string.
+        // Get current timestamp.
         let timestamp = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
         // Create a chat message with the current sequence number.
         let chat_msg = Message::ChatMessage {
@@ -257,7 +266,7 @@ where
             timestamp: timestamp.clone(),
         };
         send_seq += 1;
-        // Serialize the chat message.
+        // Serialize and encrypt the chat message.
         let serialized = bincode::serialize(&chat_msg)?;
         let packet = encrypt_message(&serialized, &peer_public, &our_secret)
             .await
@@ -265,6 +274,8 @@ where
         send_message(&mut writer, &packet).await?;
     }
 
+    // Gracefully shut down the writer to signal the connection is closing.
+    writer.shutdown().await?;
     println!("\nChat session ended.");
     // Wait for the receiver task to complete.
     recv_task.await?;
