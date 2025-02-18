@@ -150,15 +150,13 @@ async fn handle_connection(stream: tokio::net::TcpStream, is_server: bool) -> Re
 
     start_chat(reader, writer, peer_public, keypair.secret).await?;
     
-    // Optionally, zeroize the secret key material here if supported:
-    // keypair.secret.zeroize();
-    
     Ok(())
 }
 
 /// Starts the chat session by spawning a task that continuously receives messages,
 /// checks sequence numbers for replay protection, and prints them with timestamps.
-/// Meanwhile, the main task reads user input, attaches a sequence number and timestamp, and sends messages.
+/// Meanwhile, the main task reads user input, attaches a sequence number and timestamp,
+/// and sends messages. Commands (currently, `/exit`) are handled.
 async fn start_chat<R, W>(
     mut reader: BufReader<R>,
     mut writer: W,
@@ -200,8 +198,9 @@ where
                                         continue;
                                     }
                                     *last_seq = seq;
-                                    // Clear the current prompt, print the peer's message with timestamp, then reprint the prompt.
-                                    print!("\rPeer [{}]: {}\nYou: ", timestamp, msg);
+                                    // Print the peer's message with timestamp on a new line.
+                                    println!("\nPeer [{}]: {}", timestamp, msg);
+                                    print!("You: ");
                                     io::stdout().flush().await.unwrap();
                                 },
                                 _ => {
@@ -229,7 +228,6 @@ where
     let mut input_line = String::new();
 
     loop {
-        // Print the prompt.
         print!("You: ");
         io::stdout().flush().await?;
         input_line.clear();
@@ -239,6 +237,17 @@ where
             break;
         }
         let trimmed = input_line.trim_end();
+        // Check for commands.
+        if trimmed.starts_with('/') {
+            // Currently only the /exit command is supported.
+            if trimmed.eq_ignore_ascii_case("/exit") {
+                println!("Exiting chat session...");
+                break;
+            } else {
+                println!("Unknown command: {}", trimmed);
+                continue;
+            }
+        }
         // Get current timestamp as formatted string.
         let timestamp = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
         // Create a chat message with the current sequence number.
@@ -256,13 +265,9 @@ where
         send_message(&mut writer, &packet).await?;
     }
 
-    // Chat loop ended.
     println!("\nChat session ended.");
-    // Optionally, wait for the receiver task to finish.
+    // Wait for the receiver task to complete.
     recv_task.await?;
-    
-    // Optionally, zeroize the secret key material here:
-    // our_secret.zeroize();
     
     Ok(())
 }
