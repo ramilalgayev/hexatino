@@ -1,20 +1,27 @@
-// src/main.rs
 mod crypto_utils;
 mod network;
 
-use crypto_box::PublicKey;
-use crypto_utils::{decrypt_message, encrypt_message, KeyPair, fingerprint};
+use crypto_box::{PublicKey, SecretKey};
+use crypto_utils::{decrypt_message, encrypt_message, fingerprint, KeyPair};
 use network::{receive_message, receive_public_key, send_message, send_public_key};
 
 use anyhow::Result;
-use crypto_box::SecretKey;
-use futures::future;
-use serde::{Serialize, Deserialize};
-use bincode;
-use tokio::io::{self, AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::TcpStream;
 use chrono::Local;
+use crossterm::{
+    cursor,
+    event::{Event, EventStream, KeyCode, KeyEventKind, KeyModifiers},
+    execute,
+    terminal::{self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen},
+};
+use futures::{select, FutureExt, StreamExt};
+use serde::{Deserialize, Serialize};
+use std::io::{stdout, Write};
+use tokio::io::{AsyncBufReadExt, BufReader, AsyncWriteExt};
+use tokio::net::TcpStream;
+use tokio::sync::mpsc;
 
+// -----------------------------------------------------------------------------
+// Message types exchanged over the network.
 #[derive(Serialize, Deserialize, Debug)]
 enum Message {
     HandshakeConfirm,
@@ -26,69 +33,271 @@ enum Message {
     Exit,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    // Usage: p2p_chat <bind_addr> [peer_addr]
-    let args: Vec<String> = std::env::args().collect();
-    if args.len() < 2 {
-        print_usage();
-        return Ok(());
+// -----------------------------------------------------------------------------
+// UI state for our interactive terminal.
+struct UIState {
+    messages: Vec<String>, // message history
+    input: String,         // current input buffer
+    seq: u64,              // outgoing message sequence number
+}
+
+impl UIState {
+    fn new() -> Self {
+        Self {
+            messages: Vec::new(),
+            input: String::new(),
+            seq: 1,
+        }
     }
-    let bind_addr = &args[1];
-    // Optional peer address for outbound connection.
-    let peer_addr = if args.len() >= 3 { Some(args[2].clone()) } else { None };
+}
 
-    // Bind to the specified local address.
-    let listener = tokio::net::TcpListener::bind(bind_addr).await?;
-    println!("Listening on {}", bind_addr);
-
-    // If a peer address was given, try an outbound connection.
-    let outbound = if let Some(p) = peer_addr {
-        Some(tokio::spawn(async move { TcpStream::connect(p).await }))
+// -----------------------------------------------------------------------------
+// Render only the message area (all rows except the bottom one).
+fn render_messages(state: &UIState) -> Result<()> {
+    let (_cols, rows) = terminal::size()?;
+    let mut stdout = stdout();
+    // Clear message area.
+    for row in 0..(rows - 1) {
+        execute!(stdout, cursor::MoveTo(0, row), Clear(ClearType::CurrentLine))?;
+    }
+    // Show as many recent messages as fit.
+    let available = (rows - 1) as usize;
+    let msgs = if state.messages.len() > available {
+        &state.messages[state.messages.len() - available..]
     } else {
-        None
+        &state.messages[..]
     };
-
-    // Wait for either an inbound connection or the outbound connection to succeed.
-    tokio::select! {
-        inbound = listener.accept() => {
-            let (stream, addr) = inbound?;
-            println!("Accepted inbound connection from {:?}", addr);
-            // For an inbound connection, we act as a server.
-            handle_connection(stream, true).await?;
-        }
-        outbound_result = async {
-            if let Some(outbound) = outbound {
-                outbound.await?
-            } else {
-                // If no peer address was provided, wait forever.
-                future::pending::<std::io::Result<TcpStream>>().await
-            }
-        } => {
-            let stream = outbound_result?;
-            println!("Outbound connection established");
-            // For an outbound connection, we act as a client.
-            handle_connection(stream, false).await?;
-        }
+    for (i, line) in msgs.iter().enumerate() {
+        execute!(stdout, cursor::MoveTo(0, i as u16))?;
+        writeln!(stdout, "{}", line)?;
     }
-
+    stdout.flush()?;
     Ok(())
 }
 
-fn print_usage() {
-    println!("Usage: p2p_chat <bind_addr> [peer_addr]");
+// -----------------------------------------------------------------------------
+// Render the input bar at the bottom.
+fn render_input(state: &UIState) -> Result<()> {
+    let (_cols, rows) = terminal::size()?;
+    let mut stdout = stdout();
+    execute!(stdout, cursor::MoveTo(0, rows - 1), Clear(ClearType::CurrentLine))?;
+    write!(stdout, "Input: {}", state.input)?;
+    stdout.flush()?;
+    Ok(())
 }
 
-/// Handles the handshake over a TcpStream. For an inbound connection (is_server == true)
-/// we wait for the peer's public key then send ours; for an outbound connection we send our
-/// public key first then wait.
-async fn handle_connection(stream: tokio::net::TcpStream, is_server: bool) -> Result<()> {
-    // Use into_split() so that both halves are owned and Send.
+// -----------------------------------------------------------------------------
+// Network receiver: continuously reads from the network, decrypts, deserializes,
+// and forwards Message values over an mpsc channel.
+async fn network_receiver<R>(
+    mut reader: BufReader<R>,
+    peer_public: PublicKey,
+    our_secret: SecretKey,
+    net_in_tx: mpsc::Sender<Message>,
+) where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    loop {
+        match receive_message(&mut reader).await {
+            Ok(packet) => match decrypt_message(&packet, &peer_public, &our_secret).await {
+                Ok(plaintext) => {
+                    if let Ok(msg) = bincode::deserialize::<Message>(&plaintext) {
+                        if net_in_tx.send(msg).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Network receiver decryption error: {:?}", e);
+                    break;
+                }
+            },
+            Err(e) => {
+                eprintln!("Network receiver error: {:?}", e);
+                break;
+            }
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Network sender: waits for outgoing Message values from an mpsc channel,
+// serializes, encrypts, and sends them.
+async fn network_sender<W>(
+    mut writer: W,
+    peer_public: PublicKey,
+    our_secret: SecretKey,
+    mut net_out_rx: mpsc::Receiver<Message>,
+) where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    while let Some(msg) = net_out_rx.recv().await {
+        let serialized = match bincode::serialize(&msg) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("Serialization error: {:?}", e);
+                continue;
+            }
+        };
+        let packet = match encrypt_message(&serialized, &peer_public, &our_secret).await {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("Encryption error: {:?}", e);
+                continue;
+            }
+        };
+        if let Err(e) = send_message(&mut writer, &packet).await {
+            eprintln!("Network sender error: {:?}", e);
+            break;
+        }
+    }
+    let _ = writer.shutdown().await;
+}
+
+// -----------------------------------------------------------------------------
+// run_ui: Takes over the terminal (alternate screen, raw mode) and runs an
+// event loop that processes keyboard events (including Ctrl+C) and incoming
+// network messages. When an exit condition occurs, it cleans up and then exits
+// the entire process.
+async fn run_ui<R, W>(
+    reader: BufReader<R>,
+    writer: W,
+    peer_public: PublicKey,
+    our_secret: SecretKey,
+) -> Result<()>
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+    W: tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let (net_in_tx, mut net_in_rx) = mpsc::channel::<Message>(100);
+    let (net_out_tx, net_out_rx) = mpsc::channel::<Message>(100);
+
+    let recv_handle = tokio::spawn(network_receiver(
+        reader,
+        peer_public.clone(),
+        our_secret.clone(),
+        net_in_tx,
+    ));
+    let send_handle = tokio::spawn(network_sender(
+        writer,
+        peer_public,
+        our_secret,
+        net_out_rx,
+    ));
+
+    terminal::enable_raw_mode()?;
+    let mut stdout = stdout();
+    execute!(stdout, EnterAlternateScreen, cursor::Hide)?;
+
+    let mut events = EventStream::new().fuse();
+    let mut ui_state = UIState::new();
+    render_messages(&ui_state)?;
+    render_input(&ui_state)?;
+
+    loop {
+        select! {
+            maybe_event = events.next().fuse() => {
+                if let Some(Ok(Event::Key(key_event))) = maybe_event {
+                    // Process only "Press" events.
+                    if key_event.kind != KeyEventKind::Press {
+                        continue;
+                    }
+                    // Check for Ctrl+C.
+                    if key_event.code == KeyCode::Char('c') && key_event.modifiers.contains(KeyModifiers::CONTROL) {
+                        let _ = net_out_tx.send(Message::Exit).await;
+                        ui_state.messages.push("You left the chat (Ctrl+C).".into());
+                        render_messages(&ui_state)?;
+                        break;
+                    }
+                    match key_event.code {
+                        KeyCode::Char(c) => {
+                            ui_state.input.push(c);
+                            render_input(&ui_state)?;
+                        },
+                        KeyCode::Backspace => {
+                            ui_state.input.pop();
+                            render_input(&ui_state)?;
+                        },
+                        KeyCode::Enter => {
+                            let trimmed = ui_state.input.trim();
+                            if !trimmed.is_empty() {
+                                if trimmed.starts_with("/exit") {
+                                    let _ = net_out_tx.send(Message::Exit).await;
+                                    ui_state.messages.push("You left the chat.".into());
+                                    render_messages(&ui_state)?;
+                                    break;
+                                } else {
+                                    let timestamp = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+                                    let chat = Message::ChatMessage {
+                                        seq: ui_state.seq,
+                                        msg: trimmed.to_string(),
+                                        timestamp: timestamp.clone(),
+                                    };
+                                    ui_state.seq += 1;
+                                    ui_state.messages.push(format!("You [{}]: {}", timestamp, trimmed));
+                                    render_messages(&ui_state)?;
+                                    let _ = net_out_tx.send(chat).await;
+                                }
+                            }
+                            ui_state.input.clear();
+                            render_input(&ui_state)?;
+                        },
+                        KeyCode::Esc => {
+                            let _ = net_out_tx.send(Message::Exit).await;
+                            ui_state.messages.push("You left the chat.".into());
+                            render_messages(&ui_state)?;
+                            break;
+                        },
+                        _ => {}
+                    }
+                }
+            },
+            maybe_net = net_in_rx.recv().fuse() => {
+                if let Some(net_msg) = maybe_net {
+                    match net_msg {
+                        Message::ChatMessage { seq: _, msg, timestamp } => {
+                            ui_state.messages.push(format!("Peer [{}]: {}", timestamp, msg));
+                            render_messages(&ui_state)?;
+                            render_input(&ui_state)?;
+                        },
+                        Message::Exit => {
+                            ui_state.messages.push("Peer left the chat.".into());
+                            render_messages(&ui_state)?;
+                            break;
+                        },
+                        _ => {}
+                    }
+                } else {
+                    ui_state.messages.push("Network connection lost.".into());
+                    render_messages(&ui_state)?;
+                    break;
+                }
+            },
+        }
+    }
+
+    // Brief pause for final messages.
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    // Clean up terminal.
+    execute!(stdout, LeaveAlternateScreen, cursor::Show)?;
+    terminal::disable_raw_mode()?;
+
+    let _ = recv_handle.await;
+    let _ = send_handle.await;
+
+    // Exit the entire process.
+    std::process::exit(0);
+}
+
+// -----------------------------------------------------------------------------
+// handle_connection_and_run_ui: Performs handshake, fingerprint auth (with
+// feedback after you type "yes"), then launches the interactive UI.
+async fn handle_connection_and_run_ui(stream: TcpStream, is_server: bool) -> Result<()> {
     let (read_half, write_half) = stream.into_split();
     let mut reader = BufReader::new(read_half);
     let mut writer = write_half;
 
-    // Generate our ephemeral keypair for this session.
     let keypair = KeyPair::new();
     let our_public = keypair.public.as_bytes();
 
@@ -108,11 +317,10 @@ async fn handle_connection(stream: tokio::net::TcpStream, is_server: bool) -> Re
         pk
     };
 
-    // Convert the received bytes into a PublicKey.
     let peer_public = PublicKey::from_slice(&peer_public_bytes)
         .map_err(|_| anyhow::anyhow!("Invalid peer public key"))?;
 
-    // --- Peer Key Authentication ---
+    // Peer key authentication.
     let fp = fingerprint(peer_public.as_bytes());
     println!("Peer key fingerprint: {}", fp);
     println!("Do you trust this key? (yes/no): ");
@@ -122,17 +330,15 @@ async fn handle_connection(stream: tokio::net::TcpStream, is_server: bool) -> Re
     if !answer.trim().eq_ignore_ascii_case("yes") {
         anyhow::bail!("Untrusted peer public key");
     }
-    // --- End Peer Key Authentication ---
+    println!("Handshake confirmed locally. Waiting for peer to confirm handshake...");
 
-    // --- Handshake Confirmation ---
-    // Each side sends a handshake confirmation and waits for the peer’s confirmation.
+    // Handshake confirmation.
     let handshake_msg = Message::HandshakeConfirm;
     let serialized = bincode::serialize(&handshake_msg)?;
     let packet = encrypt_message(&serialized, &peer_public, &keypair.secret)
         .await
         .map_err(|e| anyhow::anyhow!("Encryption failed: {:?}", e))?;
     send_message(&mut writer, &packet).await?;
-    // Wait for handshake confirmation from peer.
     let received_packet = receive_message(&mut reader).await?;
     let decrypted = decrypt_message(&received_packet, &peer_public, &keypair.secret)
         .await
@@ -141,144 +347,56 @@ async fn handle_connection(stream: tokio::net::TcpStream, is_server: bool) -> Re
         .map_err(|e| anyhow::anyhow!("Failed to deserialize handshake confirmation: {:?}", e))?;
     match received_msg {
         Message::HandshakeConfirm => {
-            println!("Handshake complete. You can start chatting.");
+            println!("Peer confirmed handshake. Launching interactive UI...");
         },
         _ => {
             anyhow::bail!("Unexpected message type during handshake");
         }
     }
-    // --- End Handshake Confirmation ---
 
-    start_chat(reader, writer, peer_public, keypair.secret).await?;
-    
-    Ok(())
+    run_ui(reader, writer, peer_public, keypair.secret).await
 }
 
-/// Starts the chat session by spawning a task that continuously receives messages,
-/// checks sequence numbers for replay protection, and prints them with timestamps.
-/// Meanwhile, the main task reads user input (and processes commands) before sending messages.
-async fn start_chat<R, W>(
-    mut reader: BufReader<R>,
-    mut writer: W,
-    peer_public: PublicKey,
-    our_secret: SecretKey,
-) -> Result<()>
-where
-    R: io::AsyncRead + Unpin + Send + 'static,
-    W: io::AsyncWrite + Unpin + Send + 'static,
-{
-    // Clone keys for the receiving task.
-    let peer_public_recv = peer_public.clone();
-    let our_secret_recv = our_secret.clone();
+// -----------------------------------------------------------------------------
+// Main: Binds to the given address and either accepts an inbound connection or
+// initiates an outbound connection, then runs handshake and launches the UI.
+#[tokio::main]
+async fn main() -> Result<()> {
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() < 2 {
+        eprintln!("Usage: p2p_chat <bind_addr> [peer_addr]");
+        return Ok(());
+    }
+    let bind_addr = &args[1];
+    let peer_addr = if args.len() >= 3 { Some(args[2].clone()) } else { None };
 
-    // For replay protection, track the last sequence number received.
-    let recv_seq = std::sync::Arc::new(tokio::sync::Mutex::new(0u64));
+    let listener = tokio::net::TcpListener::bind(bind_addr).await?;
+    println!("Listening on {}", bind_addr);
 
-    // Spawn a task to continuously receive, decrypt, and process messages.
-    let recv_seq_clone = recv_seq.clone();
-    let recv_task = tokio::spawn(async move {
-        loop {
-            match receive_message(&mut reader).await {
-                Ok(packet) => {
-                    match decrypt_message(&packet, &peer_public_recv, &our_secret_recv).await {
-                        Ok(plaintext) => {
-                            // Deserialize the message.
-                            let msg_enum: Message = match bincode::deserialize(&plaintext) {
-                                Ok(msg) => msg,
-                                Err(e) => {
-                                    eprintln!("Failed to deserialize message: {:?}", e);
-                                    continue;
-                                }
-                            };
-                            match msg_enum {
-                                Message::ChatMessage { seq, msg, timestamp } => {
-                                    let mut last_seq = recv_seq_clone.lock().await;
-                                    if seq <= *last_seq {
-                                        eprintln!("Replay or out-of-order message detected (seq: {})", seq);
-                                        continue;
-                                    }
-                                    *last_seq = seq;
-                                    // Print the peer's message with its timestamp on its own line.
-                                    println!("\nPeer [{}]: {}", timestamp, msg);
-                                },
-                                Message::Exit => {
-                                    println!("\nPeer has left the chat. Exiting...");
-                                    break;
-                                },
-                                _ => {
-                                    eprintln!("Unexpected message type received during chat.");
-                                }
-                            }
-                        }
-                        Err(e) => eprintln!("Failed to decrypt a message: {:?}", e),
-                    }
-                }
-                Err(e) => {
-                    eprintln!("Error receiving message: {:?}", e);
-                    break;
-                }
-            }
-        }
-    });
+    let outbound = if let Some(p) = peer_addr {
+        Some(tokio::spawn(async move { TcpStream::connect(p).await }))
+    } else {
+        None
+    };
 
-    // Sequence number for outgoing messages.
-    let mut send_seq = 1u64;
-
-    // Create a BufReader for standard input.
-    let stdin = io::stdin();
-    let mut stdin_reader = BufReader::new(stdin);
-    let mut input_line = String::new();
-
-    loop {
-        // Print prompt.
-        print!("You: ");
-        io::stdout().flush().await?;
-        input_line.clear();
-        let bytes_read = stdin_reader.read_line(&mut input_line).await?;
-        if bytes_read == 0 {
-            // End-of-file (Ctrl-D).
-            break;
-        }
-        let trimmed = input_line.trim_end();
-        // Check for commands.
-        if trimmed.starts_with('/') {
-            if trimmed.eq_ignore_ascii_case("/exit") {
-                // Send an exit message.
-                let exit_msg = Message::Exit;
-                let serialized = bincode::serialize(&exit_msg)?;
-                let packet = encrypt_message(&serialized, &peer_public, &our_secret)
-                    .await
-                    .map_err(|e| anyhow::anyhow!("Encryption failed: {:?}", e))?;
-                send_message(&mut writer, &packet).await?;
-                println!("Exiting chat session...");
-                break;
+    tokio::select! {
+        inbound = listener.accept() => {
+            let (stream, addr) = inbound?;
+            println!("Accepted inbound connection from {:?}", addr);
+            handle_connection_and_run_ui(stream, true).await?;
+        },
+        outbound_result = async {
+            if let Some(outbound) = outbound {
+                outbound.await?
             } else {
-                println!("Unknown command: {}", trimmed);
-                continue;
+                futures::future::pending::<std::io::Result<TcpStream>>().await
             }
+        } => {
+            let stream = outbound_result?;
+            println!("Outbound connection established");
+            handle_connection_and_run_ui(stream, false).await?;
         }
-        // Get current timestamp.
-        let timestamp = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
-        // Create a chat message with the current sequence number.
-        let chat_msg = Message::ChatMessage {
-            seq: send_seq,
-            msg: trimmed.to_string(),
-            timestamp: timestamp.clone(),
-        };
-        send_seq += 1;
-        // Serialize and encrypt the chat message.
-        let serialized = bincode::serialize(&chat_msg)?;
-        let packet = encrypt_message(&serialized, &peer_public, &our_secret)
-            .await
-            .map_err(|e| anyhow::anyhow!("Encryption failed: {:?}", e))?;
-        send_message(&mut writer, &packet).await?;
     }
 
-    // Gracefully shut down the writer to signal the connection is closing.
-    writer.shutdown().await?;
-    println!("\nChat session ended.");
-    // Wait for the receiver task to complete.
-    recv_task.await?;
-    
     Ok(())
 }
