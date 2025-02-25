@@ -1,7 +1,7 @@
-use anyhow::Result;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-// Send a length-prefixed message.
+use crate::error::Result;
+
 pub async fn send_message<T: AsyncWrite + Unpin>(writer: &mut T, message: &[u8]) -> Result<()> {
     let length = (message.len() as u32).to_be_bytes();
     writer.write_all(&length).await?;
@@ -10,7 +10,6 @@ pub async fn send_message<T: AsyncWrite + Unpin>(writer: &mut T, message: &[u8])
     Ok(())
 }
 
-// Receive a length-prefixed message.
 pub async fn receive_message<T: AsyncRead + Unpin>(reader: &mut T) -> Result<Vec<u8>> {
     let mut length_buf = [0u8; 4];
     reader.read_exact(&mut length_buf).await?;
@@ -20,12 +19,10 @@ pub async fn receive_message<T: AsyncRead + Unpin>(reader: &mut T) -> Result<Vec
     Ok(buffer)
 }
 
-// Convenience function to send a public key.
-pub async fn send_public_key<T: AsyncWrite + Unpin>(writer: &mut T, public_key: &[u8]) -> Result<()> {
-    send_message(writer, public_key).await
+pub async fn send_public_key<T: AsyncWrite + Unpin>(writer: &mut T, key: &[u8]) -> Result<()> {
+    send_message(writer, key).await
 }
 
-// Convenience function to receive a public key.
 pub async fn receive_public_key<T: AsyncRead + Unpin>(reader: &mut T) -> Result<Vec<u8>> {
     receive_message(reader).await
 }
