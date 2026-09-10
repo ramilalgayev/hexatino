@@ -29,7 +29,7 @@ cargo build --release
 Run with:
 
 ```bash
-cargo run --release -- <BIND_ADDR> [PEER_ADDR]
+./hexatino <BIND_ADDR> [PEER_ADDR]
 ```
 
 ## Usage
@@ -37,13 +37,13 @@ cargo run --release -- <BIND_ADDR> [PEER_ADDR]
 Start a listener:
 
 ```bash
-cargo run --release -- 0.0.0.0:9000
+./hexatino 0.0.0.0:9000
 ```
 
 Connect to a peer:
 
 ```bash
-cargo run --release -- 127.0.0.1:9001 127.0.0.1:9000
+./hexatino 127.0.0.1:9001 127.0.0.1:9000
 ```
 
 After connecting, Hexatino displays the peer fingerprint. Verify it over a trusted channel before accepting the connection.
